@@ -396,6 +396,25 @@ header.top, main, footer{position:relative; z-index:1;}
   <section>
     <div class="section-head">
       <div>
+        <span class="eyebrow">PENJUALAN BERDASARKAN SOURCE</span>
+        <h2>Dine In, Take Away &amp; Delivery per brand</h2>
+        <p>Dikelompokkan dari kolom "order source" pada laporan Olsera. <b>Dine In</b> mencakup dua sub-channel: <b>Dine In Offline</b> (order langsung di outlet) dan <b>Dine In Online</b> (order dine-in via aplikasi/QR). Nilai per nota (order) diatribusikan ke brand dengan kontribusi revenue terbesar di dalamnya, sama seperti perhitungan Laporan Nota. Kolom <b>Service Charge</b> &amp; <b>Tax (10%)</b> ditampilkan sebelum Total sebagai rincian — dihitung langsung per item dari kolom "service charge"/"tax_amount" pada Sales Items By Date, berlaku untuk semua order apa pun metode pembayarannya (angkanya sudah termasuk di dalam Total, bukan tambahan di luar Total).</p>
+      </div>
+    </div>
+    <div id="sourceCards" style="display:grid; grid-template-columns:repeat(auto-fit, minmax(180px,1fr)); gap:14px; margin-bottom:16px;"></div>
+    <div class="panel" style="padding:0; overflow:hidden;">
+      <div style="max-height:320px; overflow:auto;">
+      <table class="prod-table" id="sourceTable">
+        <thead><tr id="sourceTableHead"><th>Brand</th></tr></thead>
+        <tbody id="sourceTableBody"></tbody>
+      </table>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <div class="section-head">
+      <div>
         <span class="eyebrow">PAJAK DAERAH</span>
         <h2>Perhitungan pajak daerah per brand — Peraturan Daerah Lombok Utara</h2>
         <p>Dihitung langsung dari kolom asli file <b>Sales Details</b> (bukan dari total item-level). Skema: <b>DPP</b> = (Subtotal − Discount) + Service Charge. <b>Pajak Daerah</b> = DPP × 10%. Kolom Discount &amp; Service Charge ditampilkan terpisah supaya rincian pengurangan diskon dan penambahan service charge terlihat jelas. Hanya untuk nota dengan metode pembayaran "Kartu Kredit" atau "Kartu Debit".</p>
@@ -781,14 +800,38 @@ function aggByBrand(records){
 function aggByOrder(records){
   const m = new Map();
   for(const r of records){
-    const [date,item,group,qty,amount,profit,order,payment,source] = r;
-    if(!m.has(order)) m.set(order, { brandRev:Object.fromEntries(BRAND_LIST.map(b=>[b,0])), total:0, payment: payment||'Lainnya' });
+    const [date,item,group,qty,amount,profit,order,payment,source,timestamp,serviceCharge,taxAmount] = r;
+    if(!m.has(order)) m.set(order, { brandRev:Object.fromEntries(BRAND_LIST.map(b=>[b,0])), total:0, payment: payment||'Lainnya', source: source||'', serviceCharge:0, taxAmount:0 });
     const o = m.get(order);
     o.brandRev[getBrand(item)] += amount;
     o.total += amount;
+    o.serviceCharge += (serviceCharge||0);
+    o.taxAmount += (taxAmount||0);
     if(payment) o.payment = payment;
+    if(source) o.source = source;
   }
   return m;
+}
+
+// ---------- Sales-by-source grouping (Dine In Offline/Online, Take Away, Delivery) ----------
+// Olsera's "order source" column uses raw values such as "DINE IN",
+// "ONLINE DINE-IN", "TAKE AWAY", "DELIVERY". We group these into the
+// categories the business actually reports on: "Dine In" (which itself
+// splits into Offline and Online sub-channels), "Take Away" and "Delivery".
+// Anything unrecognized falls back to "Lainnya" (or the raw value) rather
+// than being silently dropped.
+const SOURCE_GROUPS = ['Dine In Offline','Dine In Online','Take Away','Delivery'];
+function getSourceGroup(source){
+  const s = String(source||'').trim().toUpperCase();
+  if(!s) return 'Lainnya';
+  if(s.includes('DINE') && s.includes('ONLINE')) return 'Dine In Online';
+  if(s.includes('DINE')) return 'Dine In Offline';
+  if(s.includes('TAKE')) return 'Take Away';
+  if(s.includes('DELIVER')) return 'Delivery';
+  return String(source).trim();
+}
+function sourceParent(group){
+  return (group==='Dine In Offline' || group==='Dine In Online') ? 'Dine In' : group;
 }
 function dominantBrand(brandRev){
   let best = 'Gilitik!', bestVal = -Infinity;
@@ -1291,6 +1334,91 @@ function renderNota(){
   document.getElementById('notaTableBody').innerHTML = grandTotal ? (bodyRows + totalRowHtml) : `<tr><td colspan="${payments.length+2}" style="text-align:center; color:var(--ink-soft); padding:20px;">Tidak ada nota pada periode ini.</td></tr>`;
 }
 
+// ---------- Penjualan berdasarkan source (Dine In/Take Away/Delivery) ----------
+function renderSourceReport(){
+  const records = filteredRecords();
+  const orders = aggByOrder(records);
+  const brandOrder = BRAND_LIST;
+  const bySourceBrand = {}; brandOrder.forEach(b=>bySourceBrand[b]={});
+  const parentTotals = {};
+  const groupSet = new Set();
+  // Service charge & Tax (10%) per brand — ini BUKAN skema Pajak Daerah
+  // (yang khusus Kartu Kredit/Debit, dihitung dari Sales Details). Ini adalah
+  // service charge & pajak 10% yang sudah dihitung Olsera sendiri per item
+  // (kolom "service charge"/"tax_amount" di Sales Items By Date, tersimpan di
+  // r[10]/r[11]), berlaku untuk SEMUA order apa pun metode pembayarannya —
+  // sudah termasuk di dalam angka revenue/Total di atas, ditampilkan di sini
+  // hanya sebagai rincian sebelum kolom Total.
+  const taxByBrand = {}; brandOrder.forEach(b=>taxByBrand[b]={serviceCharge:0, tax:0});
+
+  for(const o of orders.values()){
+    const brand = dominantBrand(o.brandRev);
+    const group = getSourceGroup(o.source);
+    groupSet.add(group);
+    if(!bySourceBrand[brand][group]) bySourceBrand[brand][group] = {count:0, revenue:0};
+    bySourceBrand[brand][group].count += 1;
+    bySourceBrand[brand][group].revenue += o.total;
+    const parent = sourceParent(group);
+    if(!parentTotals[parent]) parentTotals[parent] = {count:0, revenue:0};
+    parentTotals[parent].count += 1;
+    parentTotals[parent].revenue += o.total;
+
+    taxByBrand[brand].serviceCharge += o.serviceCharge;
+    taxByBrand[brand].tax += o.taxAmount;
+  }
+
+  const knownPresent = SOURCE_GROUPS.filter(g=>groupSet.has(g));
+  const extraGroups = [...groupSet].filter(g=>!SOURCE_GROUPS.includes(g)).sort();
+  const groups = [...knownPresent, ...extraGroups];
+  const parentOrder = ['Dine In','Take Away','Delivery', ...extraGroups.filter(g=>!['Dine In','Take Away','Delivery'].includes(sourceParent(g)) && !['Dine In','Take Away','Delivery'].includes(g))];
+
+  const grandRevenue = Object.values(parentTotals).reduce((s,v)=>s+v.revenue,0);
+  const cardsEl = document.getElementById('sourceCards');
+  if(cardsEl){
+    cardsEl.innerHTML = parentOrder.filter(p=>parentTotals[p]).map(p=>{
+      const v = parentTotals[p];
+      const pct = grandRevenue ? (v.revenue/grandRevenue*100) : 0;
+      let sub = `${fmtNum(v.count)} nota · ${pct.toFixed(1)}% dari total`;
+      if(p==='Dine In'){
+        let off=0, onl=0;
+        for(const b of brandOrder){
+          off += (bySourceBrand[b]['Dine In Offline']?.revenue)||0;
+          onl += (bySourceBrand[b]['Dine In Online']?.revenue)||0;
+        }
+        sub += ` (Offline ${fmtIDRShort(off)} · Online ${fmtIDRShort(onl)})`;
+      }
+      return `<div class="panel">
+        <span class="eyebrow">${p.toUpperCase()}</span>
+        <div style="font-family:'Fraunces',serif; font-size:23px; font-weight:600; margin-top:6px;">${fmtIDRShort(v.revenue)}</div>
+        <div class="sub" style="font-size:12px; color:var(--ink-soft); margin-top:6px;">${sub}</div>
+      </div>`;
+    }).join('');
+  }
+
+  const headEl = document.getElementById('sourceTableHead');
+  if(headEl) headEl.innerHTML = `<th>Brand</th>${groups.map(g=>`<th>${g}</th>`).join('')}<th>Service Charge</th><th>Tax (10%)</th><th>Total</th>`;
+
+  const totalRow = {}; groups.forEach(g=>totalRow[g]=0);
+  let totalServiceCharge = 0, totalTax = 0;
+  const bodyRows = brandOrder.map(b=>{
+    let rowTotal = 0;
+    const cells = groups.map(g=>{
+      const v = (bySourceBrand[b][g]||{revenue:0}).revenue;
+      rowTotal += v; totalRow[g] += v;
+      return `<td>${v ? fmtIDR(v) : '-'}</td>`;
+    }).join('');
+    const svc = taxByBrand[b].serviceCharge, tax = taxByBrand[b].tax;
+    totalServiceCharge += svc; totalTax += tax;
+    return `<tr><td style="font-weight:700; color:${BRAND_COLORS[b]};">${b}</td>${cells}<td>+ ${fmtIDR(svc)}</td><td>${fmtIDR(tax)}</td><td style="font-weight:700;">${fmtIDR(rowTotal)}</td></tr>`;
+  }).join('');
+  const grandTotal = Object.values(totalRow).reduce((a,c)=>a+c,0);
+  const totalRowHtml = `<tr style="background:var(--sand);"><td style="font-weight:700;">TOTAL</td>${groups.map(g=>`<td style="font-weight:700;">${fmtIDR(totalRow[g])}</td>`).join('')}<td style="font-weight:700;">+ ${fmtIDR(totalServiceCharge)}</td><td style="font-weight:700;">${fmtIDR(totalTax)}</td><td style="font-weight:700;">${fmtIDR(grandTotal)}</td></tr>`;
+  const bodyEl = document.getElementById('sourceTableBody');
+  if(bodyEl){
+    bodyEl.innerHTML = grandTotal ? (bodyRows + totalRowHtml) : `<tr><td colspan="${groups.length+3}" style="text-align:center; color:var(--ink-soft); padding:20px;">Tidak ada data source pada periode ini.</td></tr>`;
+  }
+}
+
 // ---------- Pajak Daerah (khusus transaksi Kartu Kredit) ----------
 // Skema: Dasar Pengenaan Pajak = Total Penjualan Kartu Kredit - 2% (biaya admin kartu),
 // lalu Pajak Daerah = Dasar Pengenaan Pajak x 10%.
@@ -1609,6 +1737,7 @@ function renderAll(){
   renderKPI();
   renderBrand();
   renderNota();
+  renderSourceReport();
   renderTaxReport();
   renderCashReport();
   renderNetSalesReport();
@@ -1874,7 +2003,15 @@ document.getElementById('fileUpload').addEventListener('change', async (e)=>{
         const source = row['order source'] || '';
         const cleanOrder=String(orderNo).trim();
         if(timestamp) orderTimeMap.set(cleanOrder,timestamp);
-        parsed.push([dateStr, item, group, Math.round(qty*100)/100, Math.round(gross), Math.round(profit), cleanOrder, payment, source, timestamp]);
+        // r[10]/r[11]: service charge & tax (10%) as computed by Olsera itself
+        // on THIS item, straight from the "service charge"/"tax_amount"
+        // columns — already folded into r[4] (gross) above, kept here as
+        // separate fields purely so reports can show the breakdown without
+        // re-deriving it. Applies to every order regardless of payment
+        // method (unlike the Pajak Daerah panel, which is a different,
+        // Kartu Kredit/Debit-only local-tax scheme computed from Sales
+        // Details totals).
+        parsed.push([dateStr, item, group, Math.round(qty*100)/100, Math.round(gross), Math.round(profit), cleanOrder, payment, source, timestamp, Math.round(service), Math.round(tax)]);
       }
       if(!parsed.length){
         showToast('Format file tidak dikenali. Pastikan ini file "Sales Items By Date" dari POS.', true);
